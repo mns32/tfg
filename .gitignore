@@ -1,2 +1,2 @@
 *.task
-mp_env/
+.venv/
