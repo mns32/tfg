@@ -12,12 +12,14 @@ MODEL_PATH = "models/pose_landmarker_full.task"
 PREPARACION = "PREPARACION"
 LISTO = "LISTO"
 PRUEBA = "PRUEBA"
+TRANSICION = "TRANSICION"
+TEST = "TEST"
+FINALIZADO = "FINALIZADO"
 
 SENTADO = "SENTADO"
 SUBIENDO = "SUBIENDO"
 DE_PIE = "DE PIE"
 BAJANDO = "BAJANDO"
-COMPLETADO = "COMPLETADO"
 
 # Colores de la interfaz en formato BGR
 GRANATE = (90, 90, 190)
@@ -38,12 +40,17 @@ tiempo_inicio_estable = None
 tiempo_inicio_de_pie = None
 tiempo_inicio_sentado_final = None
 tiempo_mensaje_listo = None
+tiempo_transicion = None
+tiempo_inicio_test = None
 
-prueba_completada = False
+repeticiones = 0
 
 TIEMPO_ESTABLE_INICIAL = 2.0
 TIEMPO_CONFIRMAR_DE_PIE = 0.7
 TIEMPO_CONFIRMAR_SENTADO = 0.7
+TIEMPO_MENSAJE_PRUEBA = 2.5
+TIEMPO_TRANSICION = 3.0
+DURACION_TEST = 30.0
 
 UMBRAL_INICIO_SUBIDA = 0.035
 UMBRAL_DE_PIE = 0.10
@@ -90,7 +97,7 @@ def calcular_angulo(a, b, c):
     return angulo
 
 
-# Calcula la visibilidad media de cadera, rodilla y tobillo de una pierna
+# Calcula la visibilidad media de cadera, rodilla y tobillo
 def visibilidad_pierna(landmarks, lado):
     if lado == "IZQUIERDO":
         indices = [23, 25, 27]
@@ -120,7 +127,7 @@ def obtener_lado_visible(landmarks):
     return "DERECHO", vis_der
 
 
-# Devuelve cadera, rodilla y tobillo de la pierna seleccionada
+# Devuelve cadera, rodilla y tobillo del lado seleccionado
 def obtener_pierna(landmarks, lado):
     if lado == "IZQUIERDO":
         return (
@@ -136,7 +143,7 @@ def obtener_pierna(landmarks, lado):
     )
 
 
-# Dibuja texto centrado con un borde oscuro para separarlo del video
+# Dibuja texto centrado con borde oscuro
 def texto_centrado(frame, texto, y, escala, color):
     fuente = cv2.FONT_HERSHEY_SIMPLEX
     grosor = 2
@@ -196,10 +203,7 @@ def dibujar_pose(frame, landmarks):
         p1 = landmarks[inicio]
         p2 = landmarks[fin]
 
-        if (
-            p1.visibility < 0.35
-            or p2.visibility < 0.35
-        ):
+        if p1.visibility < 0.35 or p2.visibility < 0.35:
             continue
 
         x1 = int(p1.x * width)
@@ -250,20 +254,116 @@ def pierna_visible(visibilidad):
     return visibilidad >= VISIBILIDAD_MINIMA
 
 
-# Comprueba si el angulo de rodilla corresponde a una posicion sentada
+# Comprueba si la rodilla corresponde aproximadamente a sentado
 def posicion_sentada(angulo):
     return angulo < ANGULO_SENTADO_MAX
 
 
-# Comprueba si la pierna esta suficientemente extendida
+# Comprueba si la rodilla esta suficientemente extendida
 def posicion_de_pie(angulo):
     return angulo > ANGULO_DE_PIE_MIN
 
 
+# Reinicia los temporizadores utilizados dentro de una repeticion
+def reiniciar_repeticion():
+    global tiempo_inicio_de_pie
+    global tiempo_inicio_sentado_final
+
+    tiempo_inicio_de_pie = None
+    tiempo_inicio_sentado_final = None
+
+
+# Procesa la maquina de estados de una repeticion
+def procesar_repeticion(
+    ahora,
+    cadera_y,
+    pierna_detectada,
+    sentado_detectado,
+    de_pie_detectado
+):
+    global estado
+    global cadera_anterior
+    global tiempo_inicio_de_pie
+    global tiempo_inicio_sentado_final
+
+    repeticion_completa = False
+
+    diferencia_cadera = cadera_sentado - cadera_y
+
+    if cadera_anterior is None:
+        movimiento_vertical = 0
+    else:
+        movimiento_vertical = cadera_anterior - cadera_y
+
+    if estado == SENTADO:
+        if (
+            pierna_detectada
+            and diferencia_cadera > UMBRAL_INICIO_SUBIDA
+            and movimiento_vertical > 0
+            and not sentado_detectado
+        ):
+            estado = SUBIENDO
+            tiempo_inicio_de_pie = None
+
+    elif estado == SUBIENDO:
+        if (
+            abs(cadera_y - cadera_sentado) < UMBRAL_SENTADO
+            and sentado_detectado
+        ):
+            estado = SENTADO
+            reiniciar_repeticion()
+
+        elif (
+            diferencia_cadera > UMBRAL_DE_PIE
+            and de_pie_detectado
+        ):
+            if tiempo_inicio_de_pie is None:
+                tiempo_inicio_de_pie = ahora
+
+            elif (
+                ahora - tiempo_inicio_de_pie
+                >= TIEMPO_CONFIRMAR_DE_PIE
+            ):
+                estado = DE_PIE
+                tiempo_inicio_sentado_final = None
+
+        else:
+            tiempo_inicio_de_pie = None
+
+    elif estado == DE_PIE:
+        if movimiento_vertical < -0.002:
+            estado = BAJANDO
+            tiempo_inicio_sentado_final = None
+
+    elif estado == BAJANDO:
+        cerca_del_asiento = (
+            abs(cadera_y - cadera_sentado)
+            < UMBRAL_SENTADO
+        )
+
+        if cerca_del_asiento and sentado_detectado:
+            if tiempo_inicio_sentado_final is None:
+                tiempo_inicio_sentado_final = ahora
+
+            elif (
+                ahora - tiempo_inicio_sentado_final
+                >= TIEMPO_CONFIRMAR_SENTADO
+            ):
+                repeticion_completa = True
+                estado = SENTADO
+                reiniciar_repeticion()
+
+        else:
+            tiempo_inicio_sentado_final = None
+
+    cadera_anterior = cadera_y
+
+    return repeticion_completa
+
+
 inicio_programa = time.monotonic()
 
-print("Chair Stand Test")
-print("Colocate de perfil respecto a la camara.")
+print("30-second Chair Stand Test")
 print("Pulsa ESC para salir.")
 
 while True:
@@ -274,6 +374,31 @@ while True:
 
     ahora = time.monotonic()
     tiempo = ahora - inicio_programa
+
+    # Estas transiciones no dependen de que MediaPipe detecte el cuerpo
+    if (
+        fase == TRANSICION
+        and tiempo_transicion is not None
+        and ahora - tiempo_transicion >= TIEMPO_TRANSICION
+    ):
+        fase = TEST
+        estado = SENTADO
+        repeticiones = 0
+        tiempo_inicio_test = ahora
+        cadera_anterior = None
+        reiniciar_repeticion()
+
+        print("TEST INICIADO")
+
+    # El cronometro continua aunque se pierda temporalmente la pose
+    if fase == TEST and tiempo_inicio_test is not None:
+        tiempo_test = ahora - tiempo_inicio_test
+
+        if tiempo_test >= DURACION_TEST:
+            fase = FINALIZADO
+
+            print("TEST FINALIZADO")
+            print(f"Repeticiones: {repeticiones}")
 
     rgb = cv2.cvtColor(
         frame,
@@ -293,9 +418,12 @@ while True:
     persona_detectada = False
     pierna_detectada = False
     sentado_detectado = False
+    de_pie_detectado = False
+
     lado_visible = None
     visibilidad = 0
     angulo_rodilla = None
+    cadera_y = None
 
     if resultado.pose_landmarks:
         persona_detectada = True
@@ -343,11 +471,10 @@ while True:
                     + 0.1 * cadera_y
                 )
 
-                tiempo_estable = (
+                if (
                     ahora - tiempo_inicio_estable
-                )
-
-                if tiempo_estable >= TIEMPO_ESTABLE_INICIAL:
+                    >= TIEMPO_ESTABLE_INICIAL
+                ):
                     fase = LISTO
                     estado = SENTADO
                     tiempo_mensaje_listo = ahora
@@ -358,88 +485,47 @@ while True:
                 cadera_sentado = None
 
         elif fase == LISTO:
-            if ahora - tiempo_mensaje_listo >= 2.5:
+            if (
+                ahora - tiempo_mensaje_listo
+                >= TIEMPO_MENSAJE_PRUEBA
+            ):
                 fase = PRUEBA
                 estado = SENTADO
                 cadera_anterior = cadera_y
+                reiniciar_repeticion()
 
-        elif fase == PRUEBA and not prueba_completada:
-            diferencia_cadera = (
-                cadera_sentado - cadera_y
+        elif fase == PRUEBA:
+            repeticion_prueba = procesar_repeticion(
+                ahora,
+                cadera_y,
+                pierna_detectada,
+                sentado_detectado,
+                de_pie_detectado
             )
 
-            if cadera_anterior is None:
-                movimiento_vertical = 0
-            else:
-                movimiento_vertical = (
-                    cadera_anterior - cadera_y
+            if repeticion_prueba:
+                fase = TRANSICION
+                tiempo_transicion = ahora
+                estado = SENTADO
+                cadera_anterior = cadera_y
+
+                print("REPETICION DE PRUEBA CORRECTA")
+
+        elif fase == TEST:
+            repeticion_completa = procesar_repeticion(
+                ahora,
+                cadera_y,
+                pierna_detectada,
+                sentado_detectado,
+                de_pie_detectado
+            )
+
+            if repeticion_completa:
+                repeticiones += 1
+
+                print(
+                    f"Repeticion completada: {repeticiones}"
                 )
-
-            if estado == SENTADO:
-                if (
-                    pierna_detectada
-                    and diferencia_cadera > UMBRAL_INICIO_SUBIDA
-                    and movimiento_vertical > 0
-                    and not sentado_detectado
-                ):
-                    estado = SUBIENDO
-                    tiempo_inicio_de_pie = None
-
-            elif estado == SUBIENDO:
-                if (
-                    abs(cadera_y - cadera_sentado)
-                    < UMBRAL_SENTADO
-                    and sentado_detectado
-                ):
-                    estado = SENTADO
-                    tiempo_inicio_de_pie = None
-
-                elif (
-                    diferencia_cadera > UMBRAL_DE_PIE
-                    and de_pie_detectado
-                ):
-                    if tiempo_inicio_de_pie is None:
-                        tiempo_inicio_de_pie = ahora
-
-                    elif (
-                        ahora - tiempo_inicio_de_pie
-                        >= TIEMPO_CONFIRMAR_DE_PIE
-                    ):
-                        estado = DE_PIE
-                        tiempo_inicio_sentado_final = None
-
-                else:
-                    tiempo_inicio_de_pie = None
-
-            elif estado == DE_PIE:
-                if movimiento_vertical < -0.002:
-                    estado = BAJANDO
-                    tiempo_inicio_sentado_final = None
-
-            elif estado == BAJANDO:
-                cerca_del_asiento = (
-                    abs(cadera_y - cadera_sentado)
-                    < UMBRAL_SENTADO
-                )
-
-                if (
-                    cerca_del_asiento
-                    and sentado_detectado
-                ):
-                    if tiempo_inicio_sentado_final is None:
-                        tiempo_inicio_sentado_final = ahora
-
-                    elif (
-                        ahora - tiempo_inicio_sentado_final
-                        >= TIEMPO_CONFIRMAR_SENTADO
-                    ):
-                        estado = COMPLETADO
-                        prueba_completada = True
-
-                else:
-                    tiempo_inicio_sentado_final = None
-
-            cadera_anterior = cadera_y
 
     if fase == PREPARACION:
         texto_centrado(
@@ -498,10 +584,7 @@ while True:
                 restante = max(
                     0,
                     TIEMPO_ESTABLE_INICIAL
-                    - (
-                        time.monotonic()
-                        - tiempo_inicio_estable
-                    )
+                    - (ahora - tiempo_inicio_estable)
                 )
 
                 texto_centrado(
@@ -555,7 +638,7 @@ while True:
             BLANCO
         )
 
-    elif fase == PRUEBA and not prueba_completada:
+    elif fase == PRUEBA:
         texto_centrado(
             frame,
             "REPETICION DE PRUEBA",
@@ -576,13 +659,9 @@ while True:
             mensaje = "DE PIE - AHORA SIENTATE"
             color_mensaje = VERDE
 
-        elif estado == BAJANDO:
+        else:
             mensaje = "SENTANDOTE..."
             color_mensaje = AZUL_GRISACEO
-
-        else:
-            mensaje = estado
-            color_mensaje = BLANCO
 
         texto_centrado(
             frame,
@@ -592,41 +671,7 @@ while True:
             color_mensaje
         )
 
-        cv2.putText(
-            frame,
-            f"Estado: {estado}",
-            (20, frame.shape[0] - 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            BLANCO,
-            2,
-            cv2.LINE_AA
-        )
-
-    if persona_detectada and angulo_rodilla is not None:
-        cv2.putText(
-            frame,
-            f"Lado: {lado_visible.lower()}",
-            (20, frame.shape[0] - 65),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            GRIS,
-            2,
-            cv2.LINE_AA
-        )
-
-        cv2.putText(
-            frame,
-            f"Rodilla: {angulo_rodilla:.0f} grados",
-            (20, frame.shape[0] - 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            GRIS,
-            2,
-            cv2.LINE_AA
-        )
-
-    if prueba_completada:
+    elif fase == TRANSICION:
         overlay = frame.copy()
 
         cv2.rectangle(
@@ -648,25 +693,129 @@ while True:
         texto_centrado(
             frame,
             "PRUEBA CORRECTA",
-            frame.shape[0] // 2 - 60,
-            1.4,
+            frame.shape[0] // 2 - 80,
+            1.2,
             VERDE
         )
 
         texto_centrado(
             frame,
             "PREPARADO?",
-            frame.shape[0] // 2 + 10,
-            1.2,
+            frame.shape[0] // 2,
+            1.4,
             AMARILLO
         )
 
         texto_centrado(
             frame,
             "VA A COMENZAR EL TEST",
-            frame.shape[0] // 2 + 80,
+            frame.shape[0] // 2 + 70,
             0.8,
             AZUL_GRISACEO
+        )
+
+    elif fase == TEST:
+        texto_centrado(
+            frame,
+            "CHAIR STAND TEST",
+            60,
+            0.9,
+            AMARILLO
+        )
+
+        texto_centrado(
+            frame,
+            str(repeticiones),
+            frame.shape[0] // 2,
+            3.5,
+            BLANCO
+        )
+
+        texto_centrado(
+            frame,
+            "REPETICIONES",
+            frame.shape[0] // 2 + 70,
+            0.8,
+            GRIS
+        )
+
+        if not persona_detectada:
+            texto_centrado(
+                frame,
+                "PERSONA NO DETECTADA",
+                frame.shape[0] - 40,
+                0.65,
+                GRANATE
+            )
+
+    elif fase == FINALIZADO:
+        overlay = frame.copy()
+
+        cv2.rectangle(
+            overlay,
+            (0, 0),
+            (frame.shape[1], frame.shape[0]),
+            NEGRO,
+            -1
+        )
+
+        frame = cv2.addWeighted(
+            overlay,
+            0.35,
+            frame,
+            0.65,
+            0
+        )
+
+        texto_centrado(
+            frame,
+            "TEST FINALIZADO",
+            frame.shape[0] // 2 - 100,
+            1.4,
+            AMARILLO
+        )
+
+        texto_centrado(
+            frame,
+            str(repeticiones),
+            frame.shape[0] // 2,
+            3.5,
+            VERDE
+        )
+
+        texto_centrado(
+            frame,
+            "REPETICIONES",
+            frame.shape[0] // 2 + 70,
+            0.8,
+            BLANCO
+        )
+
+    if (
+        persona_detectada
+        and angulo_rodilla is not None
+        and fase in [PREPARACION, LISTO, PRUEBA]
+    ):
+        cv2.putText(
+            frame,
+            f"Lado: {lado_visible.lower()}",
+            (20, frame.shape[0] - 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            GRIS,
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            frame,
+            f"Rodilla: {angulo_rodilla:.0f} grados",
+            (20, frame.shape[0] - 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            GRIS,
+            2,
+            cv2.LINE_AA
         )
 
     cv2.imshow(
